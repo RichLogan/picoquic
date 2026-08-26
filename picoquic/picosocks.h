@@ -217,6 +217,22 @@ int picoquic_sendmsg(SOCKET_TYPE fd,
     const char* bytes, int length,
     int send_msg_size, int * sock_err);
 
+#define PICOQUIC_SENDMSG_BATCH_MAX 10
+
+typedef struct st_picoquic_sendmsg_batch_message_t {
+    struct sockaddr* addr_dest;
+    struct sockaddr* addr_from;
+    int dest_if;
+    const char* bytes;
+    int length;
+    int send_msg_size;
+    int bytes_sent;
+    int sock_err;
+} picoquic_sendmsg_batch_message_t;
+
+int picoquic_sendmsg_batch(SOCKET_TYPE fd,
+    picoquic_sendmsg_batch_message_t* messages, size_t message_count);
+
 int picoquic_send_through_socket(
     SOCKET_TYPE fd,
     struct sockaddr* addr_dest,

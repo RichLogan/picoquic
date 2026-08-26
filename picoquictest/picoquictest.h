@@ -119,6 +119,8 @@ int binlog_test(void);
 int qlog_frames_test(void);
 int app_message_overflow_test(void);
 int socket_test(void);
+int socket_send_batch_test(void);
+int socket_send_batch_partial_test(void);
 int test_stateless_blowback(void);
 int ticket_store_test(void);
 int ticket_seed_test(void);

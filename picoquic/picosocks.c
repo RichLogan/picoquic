@@ -19,6 +19,10 @@
 * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "picosocks.h"
 #include "picoquic_utils.h"
 
@@ -1163,6 +1167,67 @@ int picoquic_sendmsg(SOCKET_TYPE fd,
     return bytes_sent;
 }
 #endif
+
+int picoquic_sendmsg_batch(SOCKET_TYPE fd,
+    picoquic_sendmsg_batch_message_t* messages, size_t message_count)
+{
+    size_t first_unsent = 0;
+
+    if (messages == NULL || message_count == 0 ||
+        message_count > PICOQUIC_SENDMSG_BATCH_MAX) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < message_count; i++) {
+        if (messages[i].addr_dest == NULL || messages[i].length < 0 ||
+            messages[i].send_msg_size < 0 ||
+            (messages[i].length > 0 && messages[i].bytes == NULL)) {
+            return -1;
+        }
+        messages[i].bytes_sent = 0;
+        messages[i].sock_err = 0;
+    }
+
+#if defined(__linux__)
+    if (message_count > 1) {
+        struct mmsghdr msgvec[PICOQUIC_SENDMSG_BATCH_MAX] = { 0 };
+        struct iovec iov[PICOQUIC_SENDMSG_BATCH_MAX] = { 0 };
+        char cmsg_buffer[PICOQUIC_SENDMSG_BATCH_MAX][1024] = { 0 };
+        int nb_sent;
+
+        for (size_t i = 0; i < message_count; i++) {
+            iov[i].iov_base = (char*)messages[i].bytes;
+            iov[i].iov_len = (size_t)messages[i].length;
+            msgvec[i].msg_hdr.msg_name = messages[i].addr_dest;
+            msgvec[i].msg_hdr.msg_namelen = picoquic_addr_length(messages[i].addr_dest);
+            msgvec[i].msg_hdr.msg_iov = &iov[i];
+            msgvec[i].msg_hdr.msg_iovlen = 1;
+            msgvec[i].msg_hdr.msg_control = cmsg_buffer[i];
+            msgvec[i].msg_hdr.msg_controllen = sizeof(cmsg_buffer[i]);
+            picoquic_socks_cmsg_format(&msgvec[i].msg_hdr,
+                (size_t)messages[i].length, (size_t)messages[i].send_msg_size,
+                messages[i].addr_from, messages[i].dest_if);
+        }
+
+        nb_sent = sendmmsg(fd, msgvec, (unsigned int)message_count, 0);
+        if (nb_sent > 0) {
+            first_unsent = (size_t)nb_sent;
+            for (size_t i = 0; i < first_unsent; i++) {
+                messages[i].bytes_sent = (int)msgvec[i].msg_len;
+            }
+        }
+    }
+#endif
+
+    for (size_t i = first_unsent; i < message_count; i++) {
+        messages[i].bytes_sent = picoquic_sendmsg(fd,
+            messages[i].addr_dest, messages[i].addr_from, messages[i].dest_if,
+            messages[i].bytes, messages[i].length, messages[i].send_msg_size,
+            &messages[i].sock_err);
+    }
+
+    return 0;
+}
 
 int picoquic_select_ex(SOCKET_TYPE* sockets,
     int nb_sockets,

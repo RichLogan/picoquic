@@ -588,6 +588,10 @@ int sockloop_test_one(sockloop_test_spec_t *spec)
             else {
                 ret = picoquic_packet_loop_v2(test_ctx->qserver, &param, sockloop_test_cb, &loop_cb);
             }
+            if (ret == 0 && spec->simulate_eio && !param.simulate_eio && !param.do_not_use_gso) {
+                DBG_PRINTF("%s", "GSO remained enabled after the simulated EIO");
+                ret = -1;
+            }
         }
     }
     /* Verify that the scenario worked. */

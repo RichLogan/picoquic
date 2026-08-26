@@ -22,6 +22,145 @@
 #include "picosocks.h"
 #include "picoquic_utils.h"
 
+static int socket_batch_test_open_receiver(SOCKET_TYPE* fd, struct sockaddr_storage* address)
+{
+    int ret = 0;
+    socklen_t address_length = sizeof(*address);
+    struct sockaddr_in bind_address = {
+        .sin_family = AF_INET,
+        .sin_port = 0,
+        .sin_addr = { .s_addr = htonl(INADDR_LOOPBACK) }
+    };
+
+    *fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (*fd == INVALID_SOCKET) {
+        DBG_PRINTF("Cannot create batch receiver, err=%d", errno);
+        ret = -1;
+    }
+    else if (bind(*fd, (struct sockaddr*)&bind_address, sizeof(bind_address)) != 0) {
+        DBG_PRINTF("Cannot bind batch receiver, err=%d", errno);
+        ret = -1;
+    }
+    else if (getsockname(*fd, (struct sockaddr*)address, &address_length) != 0) {
+        DBG_PRINTF("Cannot query batch receiver, err=%d", errno);
+        ret = -1;
+    }
+
+    return ret;
+}
+
+static int socket_batch_test_receive(SOCKET_TYPE fd, const char* expected, size_t expected_length)
+{
+    int ret = 0;
+    int bytes_received;
+    uint8_t buffer[32];
+    uint64_t current_time = picoquic_current_time();
+    struct sockaddr_storage addr_from = { 0 };
+    struct sockaddr_storage addr_dest = { 0 };
+    int dest_if = 0;
+    unsigned char received_ecn = 0;
+
+    bytes_received = picoquic_select(&fd, 1, &addr_from, &addr_dest, &dest_if, &received_ecn,
+        buffer, sizeof(buffer), 1000000, &current_time);
+    if (bytes_received != (int)expected_length ||
+        picoquic_constant_time_memcmp(buffer, (const uint8_t*)expected, expected_length) != 0) {
+        DBG_PRINTF("Batch receive returned %d bytes, expected %zu", bytes_received, expected_length);
+        ret = -1;
+    }
+
+    return ret;
+}
+
+int socket_send_batch_test(void)
+{
+    int ret = 0;
+    SOCKET_TYPE send_fd = INVALID_SOCKET;
+    SOCKET_TYPE receive_fd[2] = { INVALID_SOCKET, INVALID_SOCKET };
+    struct sockaddr_storage receive_address[2] = { 0 };
+    static const char message_0[] = "batch-0";
+    static const char message_1[] = "batch-1";
+    picoquic_sendmsg_batch_message_t messages[2] = {
+        { .addr_dest = (struct sockaddr*)&receive_address[0], .bytes = message_0, .length = sizeof(message_0) },
+        { .addr_dest = (struct sockaddr*)&receive_address[1], .bytes = message_1, .length = sizeof(message_1) }
+    };
+
+    if (socket_batch_test_open_receiver(&receive_fd[0], &receive_address[0]) != 0 ||
+        socket_batch_test_open_receiver(&receive_fd[1], &receive_address[1]) != 0 ||
+        (send_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET) {
+        ret = -1;
+    }
+    else if (picoquic_sendmsg_batch(send_fd, messages, 2) != 0 ||
+        messages[0].bytes_sent != (int)sizeof(message_0) ||
+        messages[1].bytes_sent != (int)sizeof(message_1)) {
+        DBG_PRINTF("Batch send results: %d/%d, errors: %d/%d",
+            messages[0].bytes_sent, messages[1].bytes_sent,
+            messages[0].sock_err, messages[1].sock_err);
+        ret = -1;
+    }
+    else if (socket_batch_test_receive(receive_fd[0], message_0, sizeof(message_0)) != 0 ||
+        socket_batch_test_receive(receive_fd[1], message_1, sizeof(message_1)) != 0) {
+        ret = -1;
+    }
+
+    if (send_fd != INVALID_SOCKET) {
+        SOCKET_CLOSE(send_fd);
+    }
+    for (size_t i = 0; i < 2; i++) {
+        if (receive_fd[i] != INVALID_SOCKET) {
+            SOCKET_CLOSE(receive_fd[i]);
+        }
+    }
+
+    return ret;
+}
+
+int socket_send_batch_partial_test(void)
+{
+    int ret = 0;
+    SOCKET_TYPE send_fd = INVALID_SOCKET;
+    SOCKET_TYPE receive_fd[2] = { INVALID_SOCKET, INVALID_SOCKET };
+    struct sockaddr_storage receive_address[2] = { 0 };
+    struct sockaddr_storage invalid_address = { 0 };
+    static const char message_0[] = "partial-0";
+    static const char message_1[] = "partial-1";
+    static const char message_2[] = "partial-2";
+    picoquic_sendmsg_batch_message_t messages[3] = {
+        { .addr_dest = (struct sockaddr*)&receive_address[0], .bytes = message_0, .length = sizeof(message_0) },
+        { .addr_dest = (struct sockaddr*)&invalid_address, .bytes = message_1, .length = sizeof(message_1) },
+        { .addr_dest = (struct sockaddr*)&receive_address[1], .bytes = message_2, .length = sizeof(message_2) }
+    };
+
+    if (socket_batch_test_open_receiver(&receive_fd[0], &receive_address[0]) != 0 ||
+        socket_batch_test_open_receiver(&receive_fd[1], &receive_address[1]) != 0 ||
+        (send_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET) {
+        ret = -1;
+    }
+    else if (picoquic_sendmsg_batch(send_fd, messages, 3) != 0 ||
+        messages[0].bytes_sent != (int)sizeof(message_0) ||
+        messages[1].bytes_sent > 0 || messages[1].sock_err == 0 ||
+        messages[2].bytes_sent != (int)sizeof(message_2)) {
+        DBG_PRINTF("Partial batch results: %d/%d/%d, errors: %d/%d/%d",
+            messages[0].bytes_sent, messages[1].bytes_sent, messages[2].bytes_sent,
+            messages[0].sock_err, messages[1].sock_err, messages[2].sock_err);
+        ret = -1;
+    }
+    else if (socket_batch_test_receive(receive_fd[0], message_0, sizeof(message_0)) != 0 ||
+        socket_batch_test_receive(receive_fd[1], message_2, sizeof(message_2)) != 0) {
+        ret = -1;
+    }
+
+    if (send_fd != INVALID_SOCKET) {
+        SOCKET_CLOSE(send_fd);
+    }
+    for (size_t i = 0; i < 2; i++) {
+        if (receive_fd[i] != INVALID_SOCKET) {
+            SOCKET_CLOSE(receive_fd[i]);
+        }
+    }
+
+    return ret;
+}
+
 static int socket_ping_pong(SOCKET_TYPE fd, struct sockaddr* server_addr,
     picoquic_server_sockets_t* server_sockets)
 {

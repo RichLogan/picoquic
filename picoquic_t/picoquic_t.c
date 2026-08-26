@@ -269,6 +269,8 @@ static const picoquic_test_def_t test_table[] = {
     { "netperf_bbr", netperf_bbr_test },
     { "nat_attack", nat_attack_test },
     { "sockets", socket_test },
+    { "socket_send_batch", socket_send_batch_test },
+    { "socket_send_batch_partial", socket_send_batch_partial_test },
     { "socket_ecn", socket_ecn_test },
     { "ticket_store", ticket_store_test },
     { "ticket_seed", ticket_seed_test },

@@ -130,6 +130,19 @@
 #include "picoquic_unified_log.h"
 #include "picoqmux.h"
 
+#if defined(__linux__)
+typedef struct st_picoquic_packet_loop_send_batch_entry_t {
+    uint8_t* send_buffer;
+    size_t send_length;
+    size_t send_msg_size;
+    struct sockaddr_storage peer_addr;
+    struct sockaddr_storage local_addr;
+    int if_index;
+    picoquic_connection_id_t log_cid;
+    picoquic_connection_id_t local_cnxid;
+} picoquic_packet_loop_send_batch_entry_t;
+#endif
+
 #if defined(_WINDOWS)
 #ifdef UDP_SEND_MSG_SIZE
 static int udp_gso_available = 1;
@@ -2304,6 +2317,129 @@ int picoquic_packet_loop_udp_received(
     return ret;
 }
 
+static void picoquic_packet_loop_process_udp_send_error(
+    picoquic_quic_t* quic,
+    picoquic_cnx_t* last_cnx,
+    const picoquic_connection_id_t* local_cnxid,
+    SOCKET_TYPE send_socket,
+    picoquic_packet_loop_param_t* param,
+    uint8_t* send_buffer,
+    size_t send_length,
+    struct sockaddr_storage* peer_addr,
+    struct sockaddr_storage* local_addr,
+    int if_index,
+    size_t send_msg_size,
+    int disable_gso,
+    const picoquic_connection_id_t* log_cid,
+    uint64_t current_time,
+    int sock_ret,
+    int sock_err)
+{
+    if (last_cnx == NULL) {
+        picoquic_log_context_free_app_message(quic, log_cid,
+            "Could not send message to AF_to=%d, AF_from=%d, if=%d, ret=%d, err=%d",
+            peer_addr->ss_family, local_addr->ss_family, if_index, sock_ret, sock_err);
+    }
+    else {
+        picoquic_log_app_message(last_cnx,
+            "Could not send message to AF_to=%d, AF_from=%d, if=%d, ret=%d, err=%d",
+            peer_addr->ss_family, local_addr->ss_family, if_index, sock_ret, sock_err);
+    }
+
+    if (picoquic_socket_error_implies_unreachable(sock_err)) {
+        if (last_cnx != NULL) {
+            picoquic_notify_destination_unreachable(last_cnx, current_time,
+                (struct sockaddr*)peer_addr, (struct sockaddr*)local_addr, if_index, sock_err);
+        }
+        else if (local_cnxid != NULL) {
+            picoquic_notify_destination_unreachable_by_cnxid(quic,
+                (picoquic_connection_id_t*)local_cnxid, current_time,
+                (struct sockaddr*)peer_addr, (struct sockaddr*)local_addr, if_index, sock_err);
+        }
+    }
+    else if (sock_err == EIO && send_msg_size > 0) {
+        size_t packet_index = 0;
+        size_t packet_size = send_msg_size;
+
+        while (packet_index < send_length) {
+            DBG_PRINTF("EIO, length= %zu/%zu", packet_index, send_length);
+            if (packet_index + packet_size > send_length) {
+                packet_size = send_length - packet_index;
+            }
+            sock_ret = picoquic_sendmsg(send_socket,
+                (struct sockaddr*)peer_addr, (struct sockaddr*)local_addr, if_index,
+                (const char*)(send_buffer + packet_index), (int)packet_size, 0, &sock_err);
+            if (sock_ret > 0) {
+                packet_index += packet_size;
+            }
+            else {
+                DBG_PRINTF("Retry with packet size=%zu fails at index %zu, ret=%d, err=%d.",
+                    packet_size, packet_index, sock_ret, sock_err);
+                if (last_cnx != NULL) {
+                    picoquic_log_app_message(last_cnx,
+                        "Retry with packet size=%zu fails at index %zu, ret=%d, err=%d.",
+                        packet_size, packet_index, sock_ret, sock_err);
+                }
+                break;
+            }
+        }
+        if (sock_ret > 0 && last_cnx != NULL) {
+            picoquic_log_app_message(last_cnx,
+                "Retry of %zu bytes by chunks of %zu bytes succeeds.",
+                send_length, send_msg_size);
+        }
+        if (disable_gso) {
+            param->do_not_use_gso = 1;
+            if (last_cnx != NULL) {
+                picoquic_log_app_message(last_cnx, "%s", "UDP GSO was disabled");
+            }
+        }
+    }
+}
+
+#if defined(__linux__)
+static void picoquic_packet_loop_flush_udp_send_batch(
+    picoquic_quic_t* quic,
+    picoquic_packet_loop_param_t* param,
+    picoquic_packet_loop_send_batch_entry_t* batch,
+    size_t* batch_count,
+    SOCKET_TYPE send_socket,
+    uint64_t current_time)
+{
+    picoquic_sendmsg_batch_message_t messages[PICOQUIC_SENDMSG_BATCH_MAX] = { 0 };
+
+    for (size_t i = 0; i < *batch_count; i++) {
+        messages[i].addr_dest = (struct sockaddr*)&batch[i].peer_addr;
+        messages[i].addr_from = (struct sockaddr*)&batch[i].local_addr;
+        messages[i].dest_if = batch[i].if_index;
+        messages[i].bytes = (const char*)batch[i].send_buffer;
+        messages[i].length = (int)batch[i].send_length;
+        messages[i].send_msg_size = (int)batch[i].send_msg_size;
+    }
+
+    if (picoquic_sendmsg_batch(send_socket, messages, *batch_count) != 0) {
+        for (size_t i = 0; i < *batch_count; i++) {
+            messages[i].bytes_sent = -1;
+            messages[i].sock_err = EINVAL;
+        }
+    }
+
+    for (size_t i = 0; i < *batch_count; i++) {
+        if (messages[i].bytes_sent <= 0) {
+            picoquic_packet_loop_process_udp_send_error(quic, NULL,
+                &batch[i].local_cnxid, send_socket, param,
+                batch[i].send_buffer, batch[i].send_length,
+                &batch[i].peer_addr, &batch[i].local_addr, batch[i].if_index,
+                batch[i].send_msg_size, batch[i].send_msg_size > 0,
+                &batch[i].log_cid, current_time,
+                messages[i].bytes_sent, messages[i].sock_err);
+        }
+    }
+
+    *batch_count = 0;
+}
+#endif
+
 int picoquic_packet_loop_do_udp_send(
     picoquic_quic_t* quic,
     picoquic_cnx_t* last_cnx,
@@ -2322,6 +2458,13 @@ int picoquic_packet_loop_do_udp_send(
     int ret = 0;
     int sock_ret = 0;
     int sock_err = 0;
+    picoquic_connection_id_t local_cnxid = { { 0 }, 0 };
+
+    if (last_cnx != NULL && last_cnx->path[0] != NULL &&
+        last_cnx->path[0]->first_tuple != NULL &&
+        last_cnx->path[0]->first_tuple->p_local_cnxid != NULL) {
+        local_cnxid = last_cnx->path[0]->first_tuple->p_local_cnxid->cnx_id;
+    }
 
     if (send_socket == INVALID_SOCKET) {
         sock_ret = -1;
@@ -2343,59 +2486,10 @@ int picoquic_packet_loop_do_udp_send(
         }
     }
     if (sock_ret <= 0) {
-        /* TODO: add a test in which the socket fails. */
-        if (last_cnx == NULL) {
-            picoquic_log_context_free_app_message(quic, log_cid, "Could not send message to AF_to=%d, AF_from=%d, if=%d, ret=%d, err=%d",
-                peer_addr->ss_family, local_addr->ss_family, if_index, sock_ret, sock_err);
-        }
-        else {
-            picoquic_log_app_message(last_cnx, "Could not send message to AF_to=%d, AF_from=%d, if=%d, ret=%d, err=%d",
-                peer_addr->ss_family, local_addr->ss_family, if_index, sock_ret, sock_err);
-
-            if (picoquic_socket_error_implies_unreachable(sock_err)) {
-                picoquic_notify_destination_unreachable(last_cnx, current_time,
-                    (struct sockaddr*)&peer_addr, (struct sockaddr*)&local_addr, if_index,
-                    sock_err);
-            }
-            else if (sock_err == EIO) {
-                /* TODO: this is an error encountered if the system supports GSO, but
-                 * the specific interface driver does not. Main example is Mininet.
-                 * Not sure that we can treat that correctly. Try to minimize the
-                 * amount of untested code? Rely on config flag? Rely on error
-                 * recovery? */
-                size_t packet_index = 0;
-                size_t packet_size = send_msg_size;
-
-                while (packet_index < send_length) {
-                    DBG_PRINTF("EIO, length= %zu/%zu", packet_index, send_length);
-                    if (packet_index + packet_size > send_length) {
-                        packet_size = send_length - packet_index;
-                    }
-                    sock_ret = picoquic_sendmsg(send_socket,
-                        (struct sockaddr*)peer_addr, (struct sockaddr*)local_addr, if_index,
-                        (const char*)(send_buffer + packet_index), (int)packet_size, 0, &sock_err);
-                    if (sock_ret > 0) {
-                        packet_index += packet_size;
-                    }
-                    else {
-                        DBG_PRINTF("Retry with packet size=%zu fails at index %zu, ret=%d, err=%d.",
-                            packet_size, packet_index, sock_ret, sock_err);
-                        picoquic_log_app_message(last_cnx, "Retry with packet size=%zu fails at index %zu, ret=%d, err=%d.",
-                            packet_size, packet_index, sock_ret, sock_err);
-                        break;
-                    }
-                }
-                if (sock_ret > 0) {
-                    picoquic_log_app_message(last_cnx, "Retry of %zu bytes by chunks of %zu bytes succeeds.",
-                        send_length, send_msg_size);
-                }
-                if (send_msg_ptr != NULL) {
-                    /* Make sure that we do not use GSO anymore in this run */
-                    send_msg_ptr = NULL;
-                    picoquic_log_app_message(last_cnx, "%s", "UDP GSO was disabled");
-                }
-            }
-        }
+        picoquic_packet_loop_process_udp_send_error(quic, last_cnx,
+            &local_cnxid, send_socket, param, send_buffer, send_length,
+            peer_addr, local_addr, if_index, send_msg_size,
+            send_msg_ptr != NULL, log_cid, current_time, sock_ret, sock_err);
     }
     return ret;
 }
@@ -2423,14 +2517,23 @@ void* picoquic_packet_loop_v3(void* v_ctx)
     uint8_t buffer[1536];
 #endif
     uint8_t* send_buffer = NULL;
+#if !defined(__linux__)
     size_t send_length = 0;
+#endif
     size_t send_msg_size = 0;
     size_t send_buffer_size = param->socket_buffer_size;
     size_t send_batch_max = (param->send_batch_max == 0) ?
         PICOQUIC_PACKET_LOOP_SEND_MAX : param->send_batch_max;
     size_t* send_msg_ptr = NULL;
+#if defined(__linux__)
+    picoquic_packet_loop_send_batch_entry_t send_batch[PICOQUIC_SENDMSG_BATCH_MAX] = { 0 };
+    size_t send_batch_count = 0;
+    SOCKET_TYPE send_batch_socket = INVALID_SOCKET;
+#endif
     int bytes_recv;
+#if !defined(__linux__)
     picoquic_connection_id_t log_cid;
+#endif
     picoquic_socket_ctx_t s_ctx[PICOQUIC_PACKET_LOOP_SOCKETS_MAX];
     int nb_sockets = 0;
     picoqmux_socket_ctx_t **sqmux_ctx = NULL;
@@ -2531,7 +2634,21 @@ void* picoquic_packet_loop_v3(void* v_ctx)
             send_buffer_size = 0xFFFF;
             send_msg_ptr = &send_msg_size;
         }
+#if defined(__linux__)
+        if (send_buffer_size > SIZE_MAX / PICOQUIC_SENDMSG_BATCH_MAX) {
+            ret = PICOQUIC_ERROR_MEMORY;
+        }
+        else {
+            send_buffer = malloc(send_buffer_size * PICOQUIC_SENDMSG_BATCH_MAX);
+            if (send_buffer != NULL) {
+                for (size_t i = 0; i < PICOQUIC_SENDMSG_BATCH_MAX; i++) {
+                    send_batch[i].send_buffer = send_buffer + i * send_buffer_size;
+                }
+            }
+        }
+#else
         send_buffer = malloc(send_buffer_size);
+#endif
         if (send_buffer == NULL) {
             ret = -1;
         }
@@ -2731,23 +2848,49 @@ void* picoquic_packet_loop_v3(void* v_ctx)
              */
             /* TODO: isolate the UDP sending logic in a function. */
             while (ret == 0 && nb_packets_sent < send_batch_max) {
-                struct sockaddr_storage peer_addr;
-                struct sockaddr_storage local_addr = { 0 };
-                int if_index = 0;
+#if defined(__linux__)
+                size_t candidate_index = send_batch_count;
+                picoquic_packet_loop_send_batch_entry_t* candidate = &send_batch[candidate_index];
+                struct sockaddr_storage* peer_addr = &candidate->peer_addr;
+                struct sockaddr_storage* local_addr = &candidate->local_addr;
+                uint8_t* packet_buffer = candidate->send_buffer;
+                size_t* packet_length = &candidate->send_length;
+                size_t* packet_msg_size = &candidate->send_msg_size;
 
-                send_length = 0; 
+                candidate->send_length = 0;
+                candidate->send_msg_size = 0;
+                candidate->if_index = 0;
+                memset(peer_addr, 0, sizeof(*peer_addr));
+                memset(local_addr, 0, sizeof(*local_addr));
+#else
+                struct sockaddr_storage peer_addr_storage;
+                struct sockaddr_storage local_addr_storage = { 0 };
+                struct sockaddr_storage* peer_addr = &peer_addr_storage;
+                struct sockaddr_storage* local_addr = &local_addr_storage;
+                int if_index = 0;
+                uint8_t* packet_buffer = send_buffer;
+                size_t* packet_length = &send_length;
+                size_t* packet_msg_size = &send_msg_size;
+#endif
+
+                *packet_length = 0;
                 ret = picoquic_prepare_next_packet_ex(quic, current_time,
-                    send_buffer, send_buffer_size, &send_length,
-                    &peer_addr, &local_addr, &if_index, &log_cid, &last_cnx,
-                    send_msg_ptr);
-                if (ret == 0 && send_length > 0) {
+                    packet_buffer, send_buffer_size, packet_length,
+#if defined(__linux__)
+                    peer_addr, local_addr, &candidate->if_index, &candidate->log_cid, &last_cnx,
+                    (send_msg_ptr == NULL) ? NULL : packet_msg_size);
+#else
+                    peer_addr, local_addr, &if_index, &log_cid, &last_cnx,
+                    (send_msg_ptr == NULL) ? NULL : packet_msg_size);
+#endif
+                if (ret == 0 && *packet_length > 0) {
                     /* If send_msg_size is defined, sendmsg may send more than one packet.
                      * We compute that to update the number of packets sent in the loop.
                      */
-                    nb_packets_sent += (send_msg_size == 0) ? 1 :
-                        (send_length + send_msg_size - 1) / (send_msg_size);
-                    if (send_length > param->send_length_max) {
-                        param->send_length_max = send_length;
+                    nb_packets_sent += (*packet_msg_size == 0) ? 1 :
+                        (*packet_length + *packet_msg_size - 1) / (*packet_msg_size);
+                    if (*packet_length > param->send_length_max) {
+                        param->send_length_max = *packet_length;
                     }
                     /* We have multiple sockets, with support for
                     * either IPv6, or IPv4, or both, and binding to a port number.
@@ -2756,15 +2899,15 @@ void* picoquic_packet_loop_v3(void* v_ctx)
                     * - either the source port is not specified, or it matches the local port.
                     */
                     SOCKET_TYPE send_socket = INVALID_SOCKET;
-                    uint16_t send_port = (peer_addr.ss_family == AF_INET) ?
-                        ((struct sockaddr_in*)&local_addr)->sin_port :
-                        ((struct sockaddr_in6*)&local_addr)->sin6_port;
+                    uint16_t send_port = (peer_addr->ss_family == AF_INET) ?
+                        ((struct sockaddr_in*)local_addr)->sin_port :
+                        ((struct sockaddr_in6*)local_addr)->sin6_port;
 
-                    bytes_sent += send_length;
+                    bytes_sent += *packet_length;
 
                     /* TODO: verify htons/ntohs */
                     for (int i = 0; i < nb_sockets_available; i++) {
-                        if (s_ctx[i].af == peer_addr.ss_family) {
+                        if (s_ctx[i].af == peer_addr->ss_family) {
                             send_socket = s_ctx[i].fd;
                             if (send_port == 0 && !param->prefer_extra_socket) {
                                 break;
@@ -2779,12 +2922,12 @@ void* picoquic_packet_loop_v3(void* v_ctx)
                         if (nb_sockets_available < PICOQUIC_PACKET_LOOP_SOCKETS_MAX) {
                             picoquic_socket_ctx_t* new_ctx = &s_ctx[nb_sockets_available];
                             memset(new_ctx, 0, sizeof(*new_ctx));
-                            new_ctx->af = peer_addr.ss_family;
-                            if (peer_addr.ss_family == AF_INET6) {
-                                new_ctx->port = ntohs(((struct sockaddr_in6*)&peer_addr)->sin6_port);
+                            new_ctx->af = peer_addr->ss_family;
+                            if (peer_addr->ss_family == AF_INET6) {
+                                new_ctx->port = ntohs(((struct sockaddr_in6*)peer_addr)->sin6_port);
                             }
                             else {
-                                new_ctx->port = ntohs(((struct sockaddr_in*)&peer_addr)->sin_port);
+                                new_ctx->port = ntohs(((struct sockaddr_in*)peer_addr)->sin_port);
                             }
                             new_ctx->n_port = htons(new_ctx->port);
                             if (picoquic_packet_loop_open_socket(param, new_ctx, ecn_value) == 0) {
@@ -2805,15 +2948,67 @@ void* picoquic_packet_loop_v3(void* v_ctx)
                             }
                         }
                     }
+#if defined(__linux__)
+                    candidate->local_cnxid.id_len = 0;
+                    if (last_cnx != NULL && last_cnx->path[0] != NULL &&
+                        last_cnx->path[0]->first_tuple != NULL &&
+                        last_cnx->path[0]->first_tuple->p_local_cnxid != NULL) {
+                        candidate->local_cnxid =
+                            last_cnx->path[0]->first_tuple->p_local_cnxid->cnx_id;
+                    }
+
+                    if (param->simulate_eio && *packet_length > PICOQUIC_MAX_PACKET_SIZE) {
+                        if (send_batch_count > 0) {
+                            picoquic_packet_loop_flush_udp_send_batch(quic, param,
+                                send_batch, &send_batch_count, send_batch_socket, current_time);
+                        }
+                        ret = picoquic_packet_loop_do_udp_send(
+                            quic, last_cnx, send_socket, param,
+                            packet_buffer, *packet_length, peer_addr, local_addr,
+                            candidate->if_index, *packet_msg_size, send_msg_ptr,
+                            &candidate->log_cid, current_time);
+                    }
+                    else {
+                        if (send_batch_count > 0 && send_socket != send_batch_socket) {
+                            picoquic_packet_loop_send_batch_entry_t saved_candidate = *candidate;
+                            picoquic_packet_loop_send_batch_entry_t available_entry = send_batch[0];
+
+                            picoquic_packet_loop_flush_udp_send_batch(quic, param,
+                                send_batch, &send_batch_count, send_batch_socket, current_time);
+                            send_batch[0] = saved_candidate;
+                            send_batch[candidate_index] = available_entry;
+                        }
+                        send_batch_socket = send_socket;
+                        send_batch_count++;
+                        if (send_batch_count == PICOQUIC_SENDMSG_BATCH_MAX) {
+                            picoquic_packet_loop_flush_udp_send_batch(quic, param,
+                                send_batch, &send_batch_count, send_batch_socket, current_time);
+                        }
+                    }
+#else
                     ret = picoquic_packet_loop_do_udp_send(
                         quic, last_cnx, send_socket, param,
-                        send_buffer, send_length, &peer_addr, &local_addr, if_index,
-                        send_msg_size, send_msg_ptr, &log_cid, current_time);
+                        packet_buffer, *packet_length, peer_addr, local_addr, if_index,
+                        *packet_msg_size, send_msg_ptr, &log_cid, current_time);
+#endif
+                    if (param->do_not_use_gso) {
+                        send_msg_ptr = NULL;
+                    }
                 }
                 else {
                     break;
                 }
             }
+
+#if defined(__linux__)
+            if (send_batch_count > 0) {
+                picoquic_packet_loop_flush_udp_send_batch(quic, param,
+                    send_batch, &send_batch_count, send_batch_socket, current_time);
+                if (param->do_not_use_gso) {
+                    send_msg_ptr = NULL;
+                }
+            }
+#endif
 
             if (ret == 0 && loop_callback != NULL) {
                 ret = loop_callback(quic, picoquic_packet_loop_after_send, loop_callback_ctx, &bytes_sent);
